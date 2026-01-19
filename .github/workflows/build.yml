@@ -1,18 +1,193 @@
-- name: Unzip project ZIP if present
-  run: |
-    shopt -s nullglob
-    ZIP_COUNT=( *.zip )
-    if [ ${#ZIP_COUNT[@]} -gt 0 ]; then
-      echo "Found zip(s): ${ZIP_COUNT[@]}"
-      # prefer strato-master-1.zip if exists
-      if [ -f "strato-master-1.zip" ]; then
-        unzip -q strato-master-1.zip -d .
-      elif [ -f "strato-master.zip" ]; then
-        unzip -q strato-master.zip -d .
-      else
-        unzip -q "${ZIP_COUNT[0]}" -d .
-      fi
-    else
-      echo "No zip found, assuming files already in repo"
-    fi
-    ls -la
+name: Build Strato APK (optimized & robust)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      # ajuste se necessário
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+        fetch-depth: 0
+
+    - name: Cache Gradle
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*','**/gradle/wrapper/gradle-wrapper.properties') }}
+        restore-keys: |
+          gradle-${{ runner.os }}-
+
+    - name: Ensure unzip available
+      run: sudo apt-get update -y && sudo apt-get install -y unzip
+
+    - name: Find & unzip project ZIP (supports strato-master-1.zip)
+      id: unzip
+      run: |
+        shopt -s nullglob
+        ZIP_COUNT=( *.zip )
+        if [ ${#ZIP_COUNT[@]} -eq 0 ]; then
+          echo "No zip found in repo root. Assuming sources are already in repo."
+          echo "zip_found=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "Found zip(s): ${ZIP_COUNT[@]}"
+        TARGET=""
+        if [ -f "strato-master-1.zip" ]; then
+          TARGET="strato-master-1.zip"
+        elif [ -f "strato-master.zip" ]; then
+          TARGET="strato-master.zip"
+        else
+          TARGET="${ZIP_COUNT[0]}"
+        fi
+
+        echo "Using zip: $TARGET"
+        unzip -q "$TARGET" -d .
+        echo "zip_found=true" >> $GITHUB_OUTPUT
+        echo "zip_name=$TARGET" >> $GITHUB_OUTPUT
+        # list extracted top-level directories
+        echo "Extracted folders:"
+        ls -la | sed -n '1,120p'
+
+    - name: Detect project directory (first dir starting with strato)
+      id: detect
+      run: |
+        DIR=$(find . -maxdepth 2 -type d -name 'strato*' -print -quit || true)
+        if [ -z "$DIR" ]; then
+          # fallback: look for folder that contains build.gradle
+          DIR=$(find . -maxdepth 3 -type f -name 'build.gradle' -exec dirname {} \; | head -n 1 || true)
+        fi
+        if [ -z "$DIR" ]; then
+          echo "project_dir="
+          echo "No project dir found (no strato*/build.gradle)."
+          exit 1
+        fi
+        # normalize path (remove leading ./)
+        DIR=${DIR#./}
+        echo "Detected project dir: $DIR"
+        echo "project_dir=$DIR" >> $GITHUB_OUTPUT
+
+    - name: Show project tree (quick check)
+      run: |
+        echo "Project dir: ${{ steps.detect.outputs.project_dir }}"
+        ls -la "${{ steps.detect.outputs.project_dir }}" || true
+        if [ -d "${{ steps.detect.outputs.project_dir }}/app" ]; then
+          echo "app module exists"
+        else
+          echo "WARNING: app module not found. Build may require different module name."
+        fi
+        echo "Listing app/libraries if exists:"
+        ls -la "${{ steps.detect.outputs.project_dir }}/app/libraries" || true
+
+    - name: Try to init submodules (if applicable)
+      run: |
+        # if there's a .git dir and submodule config, init/update
+        if [ -d .git ] && git submodule status --recursive >/dev/null 2>&1; then
+          echo "Initializing/updating git submodules..."
+          git submodule sync --recursive || true
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+          echo "Submodule status:"
+          git submodule status --recursive || true
+        else
+          echo "No git submodules detected or no .git; skipping submodule init."
+        fi
+
+    - name: Setup Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+        cache: gradle
+
+    - name: Setup Android SDK (cmdline tools)
+      uses: android-actions/setup-android@v3
+      with:
+        api-level: 33
+        target: android-33
+
+    - name: Install NDK + CMake (with retries)
+      run: |
+        set -e
+        tries=0
+        max=3
+        until [ $tries -ge $max ]
+        do
+          yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-33" "build-tools;33.0.2" && break
+          tries=$((tries+1))
+          echo "Retrying sdkmanager (attempt $tries)..."
+          sleep 5
+        done
+        echo "NDK and CMake installed. Listing SDK root:"
+        ls -la ${ANDROID_SDK_ROOT} || true
+      env:
+        ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+
+    - name: Give gradlew permission
+      run: |
+        PROJECT_DIR="${{ steps.detect.outputs.project_dir }}"
+        if [ -f "$PROJECT_DIR/gradlew" ]; then
+          chmod +x "$PROJECT_DIR/gradlew"
+        else
+          echo "gradlew not found in $PROJECT_DIR (maybe wrapper missing)."
+        fi
+
+    - name: Run Gradle assembleDebug (capture log, long timeout)
+      id: gradle-build
+      run: |
+        set -o pipefail
+        PROJECT_DIR="${{ steps.detect.outputs.project_dir }}"
+        echo "Building in $PROJECT_DIR"
+        cd "$PROJECT_DIR"
+        echo "JAVA_HOME=$JAVA_HOME"
+        ./gradlew :app:assembleDebug --no-daemon --parallel --stacktrace 2>&1 | tee build.log
+        echo "EXIT_CODE=$?" > build-exit.txt
+      timeout-minutes: 90
+
+    - name: Collect CMake/CXX error logs (if any)
+      if: always()
+      run: |
+        PROJECT_DIR="${{ steps.detect.outputs.project_dir }}"
+        # find common cxx/CMake error logs
+        find "$PROJECT_DIR" -type f -path "*/.cxx/*/CMakeFiles/CMakeError.log" -print -exec sed -n '1,200p' {} \; || true
+        find "$PROJECT_DIR" -type f -path "*/.cxx/*/CMakeFiles/CMakeOutput.log" -print -exec sed -n '1,200p' {} \; || true
+        ls -la "$PROJECT_DIR/.cxx" || true
+
+    - name: Upload build log (always)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: strato-build-log
+        path: |
+          ${{ steps.detect.outputs.project_dir }}/build.log
+          ${{ steps.detect.outputs.project_dir }}/build-exit.txt
+
+    - name: Upload any C/C++ logs (always)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cxx-logs
+        path: |
+          ${{ steps.detect.outputs.project_dir }}/app/.cxx/**
+          ${{ steps.detect.outputs.project_dir }}/app/**/.cxx/**
+
+    - name: Upload APK artifact (if generated)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: strato-apk
+        path: |
+          ${{ steps.detect.outputs.project_dir }}/app/build/outputs/**/*.apk
