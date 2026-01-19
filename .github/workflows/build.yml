@@ -1,0 +1,119 @@
+name: Build Strato APK (Debug, robust)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Cache Gradle
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches
+          ~/.gradle/wrapper
+        key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*','**/gradle/wrapper/gradle-wrapper.properties') }}
+        restore-keys: |
+          gradle-${{ runner.os }}-
+
+    - name: Ensure unzip available
+      run: sudo apt-get update && sudo apt-get install -y unzip
+
+    - name: Unzip project ZIP if present
+      run: |
+        shopt -s nullglob
+        ZIP_COUNT=( *.zip )
+        if [ ${#ZIP_COUNT[@]} -gt 0 ]; then
+          echo "Found zip(s): ${ZIP_COUNT[@]}"
+          # prefer strato-master.zip if exists
+          if [ -f "strato-master.zip" ]; then
+            unzip -q strato-master.zip -d .
+          else
+            unzip -q "${ZIP_COUNT[0]}" -d .
+          fi
+        else
+          echo "No zip found, assuming files already in repo"
+        fi
+        ls -la
+
+    - id: detect
+      name: Detect project folder
+      run: |
+        # find the first dir that starts with "strato"
+        DIR=$(find . -maxdepth 2 -type d -name 'strato*' -print -quit)
+        if [ -z "$DIR" ]; then
+          echo "project_dir="
+          echo "No folder matching 'strato*' found in repo root or extracted zip."
+          exit 1
+        fi
+        echo "Detected project dir: $DIR"
+        echo "project_dir=$DIR" >> $GITHUB_OUTPUT
+
+    - name: Show project tree (quick)
+      run: |
+        echo "Project dir: ${{ steps.detect.outputs.project_dir }}"
+        ls -la "${{ steps.detect.outputs.project_dir }}"
+        if [ -d "${{ steps.detect.outputs.project_dir }}/app" ]; then
+          echo "app module exists"
+        else
+          echo "WARNING: app module not found (build may need a different module name)"
+        fi
+
+    - name: Setup Java 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Setup Android SDK (cmdline tools)
+      uses: android-actions/setup-android@v3
+      with:
+        api-level: 33
+        target: android-33
+        # this action will provide sdkmanager, adb, etc.
+
+    - name: Install required NDK and CMake
+      run: |
+        yes | sdkmanager --sdk_root=${ANDROID_SDK_ROOT} "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-33" "build-tools;33.0.2"
+        ls -la ${ANDROID_SDK_ROOT}
+      env:
+        ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+
+    - name: Give gradlew permission
+      run: |
+        chmod +x "${{ steps.detect.outputs.project_dir }}/gradlew" || true
+
+    - name: Run Gradle assembleDebug (capture log)
+      id: gradle-build
+      run: |
+        set -o pipefail
+        PROJECT_DIR="${{ steps.detect.outputs.project_dir }}"
+        echo "Building in $PROJECT_DIR"
+        cd "$PROJECT_DIR"
+        ./gradlew :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+        echo "EXIT_CODE=$?" > build-exit.txt
+      continue-on-error: false
+
+    - name: Upload build log (always)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: strato-build-log
+        path: |
+          ${{ steps.detect.outputs.project_dir }}/build.log
+          ${{ steps.detect.outputs.project_dir }}/build-exit.txt
+
+    - name: Upload APK artifact (if generated)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: strato-apk
+        path: ${{ steps.detect.outputs.project_dir }}/app/build/outputs/**/*.apk
